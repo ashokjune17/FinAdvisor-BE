@@ -43,6 +43,10 @@ def get_db():
         conn.close()
 
 
+class Phone(BaseModel):
+    phone_number: str
+
+
 @app.post("/onboarding")
 async def onboarding(data: Phone, conn=Depends(get_db)):
     ph = str(data.phone_number)
@@ -341,10 +345,11 @@ async def user_onboard(data: UserOnboardInput, conn=Depends(get_db)):
 
     if bool(re.fullmatch(r"\d{10}", ph)):
         cur = conn.cursor()
-        query = """ UPDATE "MF_Data"."user_profile" SET name = %s, age = %s, dob = %s, marital_status = %s, income = %s, pan = %s, risk = %s WHERE phone_number = %s; """
+        query = """ UPDATE "MF_Data"."user_profile" SET name = %s, age = %s, dob = %s, marital_status = %s, income = %s, pan = %s, risk = %s, is_basic_completed = %s, is_risk_completed = %s WHERE phone_number = %s; """
         try:
-            cur.execute(query, (name, age, dob, marital_status, income, pan,
-                                risk_score.get('risk_rating'), ph))
+            cur.execute(query,
+                        (name, age, dob, marital_status, income, pan,
+                         risk_score.get('risk_rating'), ph, "True", "True"))
             conn.commit()
             print("Insert OK")
             return {
@@ -368,7 +373,28 @@ async def get_goals(phone_number: str, conn=Depends(get_db)):
         query = """ SELECT * FROM "MF_Data"."goal_details" WHERE phone_number = %s; """
         cur.execute(query, (str(ph), ))
         goals = cur.fetchall()
-        response = {"result": "Success", "Goals": goals}
+        goal_data = []
+        for goal in goals:
+            goal_id = goal.get('goal_id')
+            query = """ SELECT * FROM "MF_Data"."fund_chosen" WHERE goal_fk = %s; """
+            cur.execute(query, (goal_id, ))
+            funds = cur.fetchall()
+            current_amount = float(goal.get('current_amount'))
+            for fund in funds:
+                fund_id = fund.get('fund_fk')
+                query = """ SELECT * FROM "MF_Data"."mf_fund_data" WHERE id = %s; """
+                cur.execute(query, (fund_id, ))
+                fund_details = cur.fetchone()
+                fund_nav = fund_details.get('nav')
+                current_amount += float(fund_nav) * fund.get('units')
+            data = {
+                "goal_id": goal.get('goal_id'),
+                "goal_name": goal.get('goal_name'),
+                "current_amount": current_amount,
+                "target_amount": goal.get('target_amount'),
+            }
+            goal_data.append(data)
+        response = {"result": "Success", "Goals": goal_data}
         return response
     else:
         return {"result": "Failure", "Message": "Invalid Phone Number"}
@@ -508,27 +534,26 @@ def query_mutual_funds(goal_id: int, conn):
     query = """ SELECT target_amount, target_date, phone_number FROM "MF_Data"."goal_details" WHERE goal_id = %s; """
     cur.execute(query, (goal_id, ))
     goal = cur.fetchone()
-    goal_target_amount = goal[0]
-    goal_target_date = goal[1]
-    phone_number = goal[2]
+    print(goal)
+    goal_target_amount = goal['target_amount']
+    goal_target_date = goal['target_date']
+    phone_number = goal['phone_number']
 
     query = """ SELECT risk FROM "MF_Data"."user_profile" WHERE phone_number = %s; """
     cur.execute(query, (phone_number, ))
     profile_risk = cur.fetchone()
-    risk = profile_risk[0]
+    risk = profile_risk['risk']
 
-    query = """ SELECT fund_name, nav,one_year_return,three_year_return FROM "MF_Data"."mf_fund_data" WHERE risk = %s; """
+    query = """ SELECT id,one_year_return,three_year_return FROM "MF_Data"."mf_fund_data" WHERE risk = %s; """
     cur.execute(query, (risk, ))
     results = cur.fetchall()
     cur.close()
-    conn.close()
 
     return {
         "funds": [{
-            'fund_name': row[0],
-            'nav': row[1],
-            'one_year_return': row[2],
-            'three_year_return': row[3],
+            'id': row['id'],
+            'one_year_return': row['one_year_return'],
+            'three_year_return': row['three_year_return'],
         } for row in results],
         'goal_target_amount':
         goal_target_amount,
@@ -542,7 +567,7 @@ def query_mutual_funds(goal_id: int, conn):
 def recommend_mutual_funds(fund_list: list, goal_target_amount: int,
                            goal_target_date: date, risk: int):
     funds_text = "\n".join([
-        f"- {fund['fund_name']} (nav: {fund['nav']}) (one_year_return: {fund['one_year_return']}) (three_year_return: {fund['three_year_return']})"
+        f"- {fund['id']} (one_year_return: {fund['one_year_return']}) (three_year_return: {fund['three_year_return']})"
         for fund in fund_list
     ])
 
@@ -555,8 +580,7 @@ def recommend_mutual_funds(fund_list: list, goal_target_amount: int,
 
         Suggest the most suitable 2-3 funds and the respective Systematic investment amount for each fund.
         Respond ONLY as a list of dictionaries.
-        ["fund_name": name, "sip": amount", "fund_name": name, "sip": amount", "fund_name": name, "sip": amount"]
-
+        ["fund_id": id, "sip": amount", "fund_id": id, "sip": amount", "fund_id": id, "sip": amount"]
 
         As the output is displayed in mobile UI, give only the fund name,
         dont give any other explanation.
@@ -587,4 +611,44 @@ async def fund_recommendation(fund_input: FundInput, conn=Depends(get_db)):
     print(fund_list, goal_target_amount, goal_target_date, risk)
     recommendation = recommend_mutual_funds(fund_list, goal_target_amount,
                                             goal_target_date, risk)
-    return {'goal_id': goal_id, 'recommendation': recommendation}
+    print(recommendation)
+    formated_recommendation = frame_recomendation_response(
+        recommendation, conn)
+    conn.close()
+    return {'goal_id': goal_id, 'recommendation': formated_recommendation}
+
+
+def frame_recomendation_response(recommendation: list, conn):
+    cur = conn.cursor()
+    query = """ SELECT fund_name FROM "MF_Data"."mf_fund_data" WHERE id = %s; """
+    for fund in recommendation:
+        cur.execute(query, (fund['fund_id'], ))
+        fund_name = cur.fetchone()
+        fund['fund_name'] = fund_name['fund_name']
+    cur.close()
+    return recommendation
+
+
+class SelectedFund(BaseModel):
+    goal_id: int
+    fund_name: str
+
+
+@app.post("/link_funds")
+async def link_funds(fund_input: SelectedFund, conn=Depends(get_db)):
+    goal_id = fund_input.goal_id
+    fund_name = fund_input.fund_name
+    cur = conn.cursor()
+    query = """ SELECT id FROM "MF_Data"."mf_fund_data" WHERE fund_name = %s; """
+    cur.execute(query, (fund_name, ))
+    fund = cur.fetchone()
+    insert_query = """ INSERT INTO "MF_Data"."fund_chosen" (goal_fk, fund_fk, fund_name, units) VALUES (%s, %s, %s, %s); """
+    try:
+        cur.execute(insert_query, (goal_id, fund['id'], fund_name, 1))
+        conn.commit()
+        print("Inserted in fund_chosen.")
+        return {"result": "Success", "Message": "Goal created"}
+    except psycopg2.Error as e:
+        conn.rollback()
+        print("Insert failed:", e)
+        return {"result": "Failure", "Message": str(e.diag.message_detail)}
