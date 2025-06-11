@@ -507,10 +507,10 @@ async def user_onboard(data: UserOnboardInput, conn=Depends(get_db)):
 
     if bool(re.fullmatch(r"\d{10}", ph)):
         cur = conn.cursor()
-        query = """ INSERT INTO "MF_Data"."user_profile" (name, age, dob, marital_status, income, pan, risk) VALUES (%s, %s, %s, %s, %s, %s, %s, %s); """
+        query = """ UPDATE "MF_Data"."user_profile" SET name = %s, age = %s, dob = %s, marital_status = %s, income = %s, pan = %s, risk = %s WHERE phone_number = %s; """
         try:
             cur.execute(query, (name, age, dob, marital_status, income, pan,
-                                risk_score.get('risk_rating')))
+                                risk_score.get('risk_rating'), ph))
             conn.commit()
             print("Insert OK")
             return {
@@ -626,3 +626,40 @@ async def get_investments(phone_number: str, conn=Depends(get_db)):
             }
             investments.append(data)
     return {"result": "Success", "Investments": investments}
+
+
+@app.get('/home')
+async def get_home(phone_number: str, conn=Depends(get_db)):
+    ph = str(phone_number)
+    cur = conn.cursor()
+    query = """ SELECT * FROM "MF_Data"."goal_details" WHERE phone_number = %s; """
+    cur.execute(query, (str(ph), ))
+    goals = cur.fetchall()
+    current_portfolio_value = 0
+    goal_data = []
+    for goal in goals:
+        goal_id = goal.get('goal_id')
+        query = """ SELECT * FROM "MF_Data"."fund_chosen" WHERE goal_fk = %s; """
+        cur.execute(query, (goal_id, ))
+        funds = cur.fetchall()
+        current_amount = float(goal.get('current_amount'))
+        for fund in funds:
+            fund_id = fund.get('fund_fk')
+            query = """ SELECT * FROM "MF_Data"."mf_fund_data" WHERE id = %s; """
+            cur.execute(query, (fund_id, ))
+            fund_details = cur.fetchone()
+            fund_nav = fund_details.get('nav')
+            current_amount += float(fund_nav) * fund.get('units')
+            current_portfolio_value += float(fund_nav) * fund.get('units')
+        data = {
+            "goal_name": goal.get('goal_name'),
+            "current_amount": current_amount,
+            "target_amount": goal.get('target_amount'),
+        }
+        goal_data.append(data)
+    response = {
+        "result": "Success",
+        "current_portfolio_value": current_portfolio_value,
+        "Goals": goal_data
+    }
+    return response
