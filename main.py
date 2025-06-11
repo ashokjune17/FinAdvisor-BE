@@ -7,8 +7,19 @@ from fastapi import FastAPI, Depends
 from pydantic import BaseModel
 from psycopg2.extras import RealDictCursor
 from datetime import date
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "*"
+    ],  # Or specify frontend domains like ["http://localhost:3000"]
+    allow_credentials=True,
+    allow_methods=["*"],  # Or ["POST", "GET", "OPTIONS", "PUT"]
+    allow_headers=["*"],  # Or ["Content-Type", "Authorization"]
+)
 
 openai.api_key = os.environ['open_ai_key']
 
@@ -19,6 +30,7 @@ DB_PARAMS = {
     'host': 'ep-square-night-a5rzba7h.us-east-2.aws.neon.tech',
     'port': 5432,
 }
+
 
 def get_db():
     conn = psycopg2.connect(**DB_PARAMS, cursor_factory=RealDictCursor)
@@ -444,3 +456,173 @@ async def link_fund(data: FundInput, conn=Depends(get_db)):
                 }
     else:
         return {"result": "Failure", "Message": "Invalid Phone Number"}
+
+
+@app.get("/")
+async def root():
+    return {"message": "Hello World"}
+
+
+class UserInput(BaseModel):
+    question: str
+    answer: str
+
+
+class ListUserInput(BaseModel):
+    items: list[UserInput]
+
+
+class UserOnboardInput(BaseModel):
+    name: str
+    dob: date
+    phone_number: str
+    marital_status: str
+    income: int
+    pan: str
+    risk_questions: ListUserInput
+
+
+@app.post("/user_onboard")
+async def user_onboard(data: UserOnboardInput, conn=Depends(get_db)):
+    print(data)
+    ph = str(data.phone_number)
+    name = str(data.name)
+    dob = data.dob
+    marital_status = str(data.marital_status)
+    income = data.income
+    pan = str(data.pan)
+    risk_score = json.loads(calc_risk_using_ai(data.risk_questions))
+    print(risk_score)
+    try:
+        if dob > date.today():
+            return {"result": "Failure", "Message": "Invalid Date of Birth"}
+    except:
+        return {"result": "Failure", "Message": "Invalid Date of Birth"}
+    else:
+        today = date.today()
+        age = today.year - dob.year
+        if (today.month, today.day) < (dob.month, dob.day):
+            age -= 1
+        print(age)
+
+    if bool(re.fullmatch(r"\d{10}", ph)):
+        cur = conn.cursor()
+        query = """ INSERT INTO "MF_Data"."user_profile" (name, age, dob, marital_status, income, pan, risk) VALUES (%s, %s, %s, %s, %s, %s, %s, %s); """
+        try:
+            cur.execute(query, (name, age, dob, marital_status, income, pan,
+                                risk_score.get('risk_rating')))
+            conn.commit()
+            print("Insert OK")
+            return {
+                "result": "Success",
+                "Message": "User Onboarded",
+            }
+        except psycopg2.Error as e:
+            conn.rollback()
+            print("Insert failed:", e)
+            return {"result": "Failure", "Message": str(e.diag.message_detail)}
+    else:
+        return {"result": "Failure", "Message": "Invalid Phone Number"}
+
+
+@app.get("/goals")
+async def get_goals(phone_number: str, conn=Depends(get_db)):
+    ph = str(phone_number)
+
+    if bool(re.fullmatch(r"\d{10}", ph)):
+        cur = conn.cursor()
+        query = """ SELECT * FROM "MF_Data"."goal_details" WHERE phone_number = %s; """
+        cur.execute(query, (str(ph), ))
+        goals = cur.fetchall()
+        response = {"result": "Success", "Goals": goals}
+        return response
+    else:
+        return {"result": "Failure", "Message": "Invalid Phone Number"}
+
+
+@app.get("/profile")
+async def get_profile(phone_number: str, conn=Depends(get_db)):
+    ph = str(phone_number)
+
+    if bool(re.fullmatch(r"\d{10}", ph)):
+        cur = conn.cursor()
+        query = """ SELECT * FROM "MF_Data"."user_profile" WHERE phone_number = %s; """
+        cur.execute(query, (ph, ))
+        profile = cur.fetchone()
+
+        if profile:
+            return {"result": "Success", "Profile": profile}
+        else:
+            return {"result": "Failure", "Message": "Profile not found"}
+    else:
+        return {"result": "Failure", "Message": "Invalid Phone Number"}
+
+
+@app.post("/calculate_risk")
+async def calculate_risk(risk_input: ListUserInput):
+    output = calc_risk_using_ai(risk_input)
+    print("Extracted profile:", output)
+    return json.loads(output)
+
+
+def calc_risk_using_ai(risk_input: ListUserInput):
+    print(risk_input.items[0].question)
+    print(len(risk_input.items))
+    prompt = f"""
+        You are a financial advisor assistant. Based on the user's answers to a few questions, determine their investment risk profile as one of the following: **Low**, **Medium**, or **High**.
+
+    Respond only with a JSON object in the following format:
+    in a sequence of 1 to 5, 1 being lowest risk and 5 being highest risk
+    {{
+      "risk_rating": "1 | 2 | 3 | 4 | 5",
+      "reason": "..."
+    }} 
+    Questions and Answers:
+    1.  Q: "{risk_input.items[0].question}"
+        A: "{risk_input.items[0].answer}"
+    2.  Q: "{risk_input.items[1].question}"
+        A: "{risk_input.items[1].answer}"
+    3.  Q: "{risk_input.items[2].question}"
+        A: "{risk_input.items[2].answer}"
+    4.  Q: "{risk_input.items[3].question}"
+        A: "{risk_input.items[3].answer}"
+    5.  Q: "{risk_input.items[4].question}"
+        A: "{risk_input.items[4].answer}"
+    Based on this, give your JSON response.
+        """
+    response = openai.chat.completions.create(
+        model="gpt-4",  # or "gpt-3.5-turbo"
+        messages=[{
+            "role": "user",
+            "content": prompt
+        }],
+        temperature=0.3)
+    return response.choices[0].message.content
+
+
+@app.get('/investments')
+async def get_investments(phone_number: str, conn=Depends(get_db)):
+    ph = str(phone_number)
+    cur = conn.cursor()
+    query = """ SELECT * FROM "MF_Data"."goal_details" WHERE phone_number = %s; """
+    cur.execute(query, (str(ph), ))
+    goals = cur.fetchall()
+    investments = []
+    for goal in goals:
+        goal_id = goal.get('goal_id')
+        query = """ SELECT * FROM "MF_Data"."fund_chosen" WHERE goal_fk = %s; """
+        cur.execute(query, (goal_id, ))
+        funds = cur.fetchall()
+        for fund in funds:
+            fund_id = fund.get('fund_fk')
+            query = """ SELECT * FROM "MF_Data"."mf_fund_data" WHERE id = %s; """
+            cur.execute(query, (fund_id, ))
+            fund_details = cur.fetchone()
+            fund_nav = fund_details.get('nav')
+            data = {
+                "fund_name": fund.get('fund_name'),
+                "fund_nav": fund_nav,
+                "invested_amount": float(fund_nav) * fund.get('units'),
+            }
+            investments.append(data)
+    return {"result": "Success", "Investments": investments}
